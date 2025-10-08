@@ -1,0 +1,975 @@
+"""
+Cement Delivery Report Tracker - Outlook Integration
+Email: packing.sscil@sevenringscement.com
+Fetches emails from: scale.sscil@sevenringscement.com
+
+Requirements:
+pip install pywin32 pandas matplotlib tkinter pillow
+"""
+
+import win32com.client
+import re
+import sqlite3
+from datetime import datetime, timedelta
+import tkinter as tk
+from tkinter import ttk, messagebox
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_tkagg import FigureCanvasTkAgg
+from matplotlib.figure import Figure
+import os
+
+class CementDeliveryTracker:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("Cement Delivery Report Tracker")
+        self.root.geometry("1400x900")
+        self.root.configure(bg="#f0f4f8")
+        
+        # Initialize database
+        self.db_path = "cement_delivery.db"
+        self.init_database()
+        
+        # Email configuration
+        self.sender_email = "scale.sscil@sevenringscement.com"
+        self.recipient_email = "packing.sscil@sevenringscement.com"
+        
+        # Variables
+        self.current_view = tk.StringVar(value="chart")
+        
+        self.setup_ui()
+        
+    def init_database(self):
+        """Initialize SQLite database"""
+        conn = sqlite3.connect(self.db_path)
+        cursor = conn.cursor()
+        
+        # Create table if not exists
+        cursor.execute('''
+            CREATE TABLE IF NOT EXISTS delivery_reports (
+                date TEXT PRIMARY KEY,
+                short INTEGER,
+                excess INTEGER,
+                per_bag_short_excess REAL,
+                bag_weight REAL,
+                email_subject TEXT,
+                email_received TEXT,
+                UNIQUE(date)
+            )
+        ''')
+        
+        # Check if bag_weight column exists, if not add it
+        cursor.execute("PRAGMA table_info(delivery_reports)")
+        columns = [column[1] for column in cursor.fetchall()]
+        
+        if 'bag_weight' not in columns:
+            print("Migrating database: Adding bag_weight column...")
+            cursor.execute('ALTER TABLE delivery_reports ADD COLUMN bag_weight REAL')
+            
+            # Calculate bag_weight for existing records
+            cursor.execute('SELECT date, per_bag_short_excess FROM delivery_reports')
+            records = cursor.fetchall()
+            
+            for date, per_bag in records:
+                if per_bag is not None:
+                    bag_weight = 50.0 - per_bag
+                    cursor.execute('UPDATE delivery_reports SET bag_weight = ? WHERE date = ?', (bag_weight, date))
+            
+            print(f"Migration complete: Updated {len(records)} records with bag_weight")
+        
+        conn.commit()
+        conn.close()
+        
+    def setup_ui(self):
+        """Setup the main UI"""
+        # Header Frame
+        header_frame = tk.Frame(self.root, bg="#2563eb", height=80)
+        header_frame.pack(fill=tk.X, pady=0)
+        header_frame.pack_propagate(False)
+        
+        title_label = tk.Label(
+            header_frame, 
+            text="🏭 Cement Delivery Report Tracker",
+            font=("Arial", 24, "bold"),
+            bg="#2563eb",
+            fg="white"
+        )
+        title_label.pack(pady=20)
+        
+        # Control Panel Frame
+        control_frame = tk.Frame(self.root, bg="#e0e7ff", height=100)
+        control_frame.pack(fill=tk.X, padx=20, pady=10)
+        control_frame.pack_propagate(False)
+        
+        # Sync Database Button
+        sync_btn = tk.Button(
+            control_frame,
+            text="📥 Sync Database",
+            command=self.show_sync_dialog,
+            bg="#4f46e5",
+            fg="white",
+            font=("Arial", 12, "bold"),
+            padx=20,
+            pady=10,
+            cursor="hand2"
+        )
+        sync_btn.pack(side=tk.LEFT, padx=10, pady=20)
+        
+        # Month Selection
+        month_label = tk.Label(
+            control_frame,
+            text="Select Month:",
+            bg="#e0e7ff",
+            font=("Arial", 11, "bold")
+        )
+        month_label.pack(side=tk.LEFT, padx=(30, 5), pady=20)
+        
+        # Generate month options (last 12 months)
+        months = self.generate_months()
+        self.month_var = tk.StringVar(value=months[0])
+        month_dropdown = ttk.Combobox(
+            control_frame,
+            textvariable=self.month_var,
+            values=months,
+            state="readonly",
+            width=20,
+            font=("Arial", 10)
+        )
+        month_dropdown.pack(side=tk.LEFT, padx=5, pady=20)
+        month_dropdown.bind("<<ComboboxSelected>>", self.on_month_change)
+        
+        # View Toggle Buttons
+        view_frame = tk.Frame(control_frame, bg="#e0e7ff")
+        view_frame.pack(side=tk.RIGHT, padx=10, pady=20)
+        
+        chart_btn = tk.Button(
+            view_frame,
+            text="📊 Chart View",
+            command=lambda: self.switch_view("chart"),
+            bg="#4f46e5",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            padx=15,
+            pady=8,
+            cursor="hand2"
+        )
+        chart_btn.pack(side=tk.LEFT, padx=5)
+        
+        table_btn = tk.Button(
+            view_frame,
+            text="📋 Tabular Form",
+            command=lambda: self.switch_view("table"),
+            bg="#4f46e5",
+            fg="white",
+            font=("Arial", 10, "bold"),
+            padx=15,
+            pady=8,
+            cursor="hand2"
+        )
+        table_btn.pack(side=tk.LEFT, padx=5)
+        
+        # Content Frame (will hold chart or table)
+        self.content_frame = tk.Frame(self.root, bg="white")
+        self.content_frame.pack(fill=tk.BOTH, expand=True, padx=20, pady=10)
+        
+        # Initialize with chart view
+        self.show_chart_view()
+        
+    def generate_months(self):
+        """Generate list of last 12 months"""
+        months = []
+        today = datetime.now()
+        for i in range(12):
+            date = today - timedelta(days=30*i)
+            month_str = date.strftime("%Y-%m")
+            month_label = date.strftime("%B %Y")
+            months.append(f"{month_str}|{month_label}")
+        return months
+    
+    def on_month_change(self, event=None):
+        """Handle month selection change"""
+        if self.current_view.get() == "chart":
+            self.show_chart_view()
+        else:
+            self.show_table_view()
+    
+    def switch_view(self, view):
+        """Switch between chart and table view"""
+        self.current_view.set(view)
+        if view == "chart":
+            self.show_chart_view()
+        else:
+            self.show_table_view()
+    
+    def show_sync_dialog(self):
+        """Show sync dialog window"""
+        dialog = tk.Toplevel(self.root)
+        dialog.title("Sync Database")
+        dialog.geometry("400x300")
+        dialog.configure(bg="white")
+        dialog.transient(self.root)
+        dialog.grab_set()
+        
+        # Center the dialog
+        dialog.update_idletasks()
+        x = (dialog.winfo_screenwidth() // 2) - (400 // 2)
+        y = (dialog.winfo_screenheight() // 2) - (300 // 2)
+        dialog.geometry(f"400x300+{x}+{y}")
+        
+        title = tk.Label(
+            dialog,
+            text="Sync Database from Outlook",
+            font=("Arial", 16, "bold"),
+            bg="white"
+        )
+        title.pack(pady=20)
+        
+        # From Date
+        from_frame = tk.Frame(dialog, bg="white")
+        from_frame.pack(pady=10)
+        
+        tk.Label(from_frame, text="From Date:", bg="white", font=("Arial", 11, "bold")).pack(side=tk.LEFT, padx=5)
+        from_date = tk.Entry(from_frame, width=15, font=("Arial", 10))
+        from_date.pack(side=tk.LEFT, padx=5)
+        from_date.insert(0, (datetime.now() - timedelta(days=30)).strftime("%Y-%m-%d"))
+        
+        tk.Label(from_frame, text="(YYYY-MM-DD)", bg="white", font=("Arial", 8)).pack(side=tk.LEFT)
+        
+        # To Date
+        to_frame = tk.Frame(dialog, bg="white")
+        to_frame.pack(pady=10)
+        
+        tk.Label(to_frame, text="To Date:", bg="white", font=("Arial", 11, "bold")).pack(side=tk.LEFT, padx=5)
+        to_date = tk.Entry(to_frame, width=15, font=("Arial", 10))
+        to_date.pack(side=tk.LEFT, padx=5)
+        to_date.insert(0, datetime.now().strftime("%Y-%m-%d"))
+        
+        tk.Label(to_frame, text="(YYYY-MM-DD)", bg="white", font=("Arial", 8)).pack(side=tk.LEFT)
+        
+        # Progress label
+        progress_label = tk.Label(dialog, text="", bg="white", font=("Arial", 10))
+        progress_label.pack(pady=20)
+        
+        # Buttons
+        btn_frame = tk.Frame(dialog, bg="white")
+        btn_frame.pack(pady=20)
+        
+        def start_sync():
+            from_val = from_date.get()
+            to_val = to_date.get()
+            
+            # Validate dates
+            try:
+                datetime.strptime(from_val, "%Y-%m-%d")
+                datetime.strptime(to_val, "%Y-%m-%d")
+            except ValueError:
+                messagebox.showerror("Error", "Invalid date format. Use YYYY-MM-DD")
+                return
+            
+            progress_label.config(text="Syncing... Please wait...")
+            dialog.update()
+            
+            count = self.sync_outlook_emails(from_val, to_val)
+            
+            progress_label.config(text=f"Successfully synced {count} records!")
+            messagebox.showinfo("Success", f"Successfully synced {count} records from Outlook!")
+            dialog.destroy()
+            
+            # Refresh current view
+            if self.current_view.get() == "chart":
+                self.show_chart_view()
+            else:
+                self.show_table_view()
+        
+        sync_btn = tk.Button(
+            btn_frame,
+            text="Sync Now",
+            command=start_sync,
+            bg="#4f46e5",
+            fg="white",
+            font=("Arial", 11, "bold"),
+            padx=20,
+            pady=8,
+            cursor="hand2"
+        )
+        sync_btn.pack(side=tk.LEFT, padx=10)
+        
+        cancel_btn = tk.Button(
+            btn_frame,
+            text="Cancel",
+            command=dialog.destroy,
+            bg="#6b7280",
+            fg="white",
+            font=("Arial", 11, "bold"),
+            padx=20,
+            pady=8,
+            cursor="hand2"
+        )
+        cancel_btn.pack(side=tk.LEFT, padx=10)
+    
+    def sync_outlook_emails(self, from_date, to_date):
+        """Sync emails from Outlook"""
+        try:
+            outlook = win32com.client.Dispatch("Outlook.Application")
+            namespace = outlook.GetNamespace("MAPI")
+            inbox = namespace.GetDefaultFolder(6)  # 6 = Inbox
+            
+            messages = inbox.Items
+            messages.Sort("[ReceivedTime]", True)
+            
+            # Filter by date
+            from_dt = datetime.strptime(from_date, "%Y-%m-%d")
+            to_dt = datetime.strptime(to_date, "%Y-%m-%d") + timedelta(days=1)
+            
+            # Filter messages
+            filter_str = f"[ReceivedTime] >= '{from_dt.strftime('%m/%d/%Y')}' AND [ReceivedTime] < '{to_dt.strftime('%m/%d/%Y')}'"
+            messages = messages.Restrict(filter_str)
+            
+            conn = sqlite3.connect(self.db_path)
+            cursor = conn.cursor()
+            
+            synced_count = 0
+            emails_by_date = {}
+            processed_count = 0
+            skipped_count = 0
+            
+            print(f"\n=== Starting Email Sync ===")
+            print(f"Date Range: {from_date} to {to_date}")
+            print(f"Total messages in date range: {messages.Count}")
+            
+            for message in messages:
+                try:
+                    processed_count += 1
+                    
+                    # Get sender email - try multiple properties
+                    sender_email = ""
+                    try:
+                        # Try SenderEmailAddress first
+                        sender_email = message.SenderEmailAddress
+                    except:
+                        pass
+                    
+                    # If SenderEmailAddress doesn't work, try Sender property
+                    if not sender_email or "@" not in sender_email:
+                        try:
+                            sender = message.Sender
+                            if sender:
+                                sender_email = sender.Address
+                        except:
+                            pass
+                    
+                    # If still no email, try SenderName
+                    if not sender_email or "@" not in sender_email:
+                        try:
+                            sender_email = message.SenderName
+                        except:
+                            pass
+                    
+                    print(f"\nProcessing email {processed_count}:")
+                    print(f"  From: {sender_email}")
+                    print(f"  Subject: {message.Subject}")
+                    print(f"  Received: {message.ReceivedTime}")
+                    
+                    # Check sender - be more flexible with matching
+                    sender_match = False
+                    if sender_email:
+                        sender_lower = sender_email.lower()
+                        if (self.sender_email.lower() in sender_lower or 
+                            "scale.sscil" in sender_lower or
+                            "sevenringscement" in sender_lower):
+                            sender_match = True
+                    
+                    if not sender_match:
+                        print(f"  ✗ Skipped: Sender doesn't match")
+                        skipped_count += 1
+                        continue
+                    
+                    # Check subject - be more flexible
+                    subject = message.Subject
+                    subject_lower = subject.lower()
+                    
+                    # Check for various spellings and variations
+                    if not (("weigh" in subject_lower and "bridge" in subject_lower) or 
+                            "weighbridge" in subject_lower):
+                        print(f"  ✗ Skipped: Subject doesn't contain 'weigh bridge'")
+                        skipped_count += 1
+                        continue
+                    
+                    if not ("report" in subject_lower or "repot" in subject_lower):
+                        print(f"  ✗ Skipped: Subject doesn't contain 'report'")
+                        skipped_count += 1
+                        continue
+                    
+                    # Parse email body
+                    body = message.Body
+                    parsed_data = self.parse_email_body(body)
+                    
+                    if parsed_data:
+                        report_date = parsed_data['date']
+                        received_time = message.ReceivedTime
+                        
+                        print(f"  ✓ Parsed successfully:")
+                        print(f"    Date: {report_date}")
+                        print(f"    Short: {parsed_data['short']}")
+                        print(f"    Excess: {parsed_data['excess']}")
+                        print(f"    Per Bag: {parsed_data['per_bag_short_excess']}")
+                        
+                        # Keep only the latest email for each date
+                        if report_date not in emails_by_date or received_time > emails_by_date[report_date]['received']:
+                            emails_by_date[report_date] = {
+                                'data': parsed_data,
+                                'subject': subject,
+                                'received': received_time
+                            }
+                            print(f"    Added to sync list")
+                        else:
+                            print(f"    Skipped: Earlier email for same date already exists")
+                    else:
+                        print(f"  ✗ Failed to parse email body")
+                        skipped_count += 1
+                
+                except Exception as e:
+                    print(f"  ✗ Error processing message: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    skipped_count += 1
+                    continue
+            
+            print(f"\n=== Inserting into Database ===")
+            # Insert into database
+            for report_date, email_info in emails_by_date.items():
+                data = email_info['data']
+                try:
+                    cursor.execute('''
+                        INSERT OR REPLACE INTO delivery_reports 
+                        (date, short, excess, per_bag_short_excess, bag_weight, email_subject, email_received)
+                        VALUES (?, ?, ?, ?, ?, ?, ?)
+                    ''', (
+                        data['date'],
+                        data['short'],
+                        data['excess'],
+                        data['per_bag_short_excess'],
+                        data['bag_weight'],
+                        email_info['subject'],
+                        email_info['received'].strftime('%Y-%m-%d %H:%M:%S')
+                    ))
+                    synced_count += 1
+                    print(f"  ✓ Inserted: {data['date']}")
+                except Exception as e:
+                    print(f"  ✗ Error inserting {data['date']}: {e}")
+            
+            conn.commit()
+            conn.close()
+            
+            print(f"\n=== Sync Complete ===")
+            print(f"Total processed: {processed_count}")
+            print(f"Skipped: {skipped_count}")
+            print(f"Successfully synced: {synced_count}")
+            
+            return synced_count
+            
+        except Exception as e:
+            print(f"\nError during sync: {str(e)}")
+            import traceback
+            traceback.print_exc()
+            messagebox.showerror("Error", f"Failed to sync emails: {str(e)}")
+            return 0
+    
+    def parse_email_body(self, body):
+        """Parse email body to extract data"""
+        try:
+            print(f"    Parsing email body...")
+            
+            # Extract date (format: DD-MMM-YYYY or DD-Mon-YYYY)
+            date_match = re.search(r'Date:\s*(\d{2})-([A-Za-z]{3})-(\d{4})', body)
+            if not date_match:
+                # Try alternative format in subject
+                date_match = re.search(r'(\d{2})\s+([A-Za-z]{3})\s+(\d{4})', body)
+            
+            if not date_match:
+                print(f"    ✗ Failed: Could not find date in format DD-MMM-YYYY")
+                return None
+            
+            day, month_str, year = date_match.groups()
+            print(f"    Found date: {day}-{month_str}-{year}")
+            
+            # Convert month string to number
+            months = {
+                'jan': 1, 'feb': 2, 'mar': 3, 'apr': 4, 'may': 5, 'jun': 6,
+                'jul': 7, 'aug': 8, 'sep': 9, 'oct': 10, 'nov': 11, 'dec': 12
+            }
+            month = months.get(month_str.lower()[:3])
+            if not month:
+                print(f"    ✗ Failed: Invalid month name '{month_str}'")
+                return None
+            
+            date_obj = datetime(int(year), month, int(day))
+            formatted_date = date_obj.strftime('%Y-%m-%d')
+            print(f"    Formatted date: {formatted_date}")
+            
+            # The email has a two-column layout:
+            # Daily Report | Monthly to Date Report
+            # So we need to find the "Delivery Information: Bag Cement" section
+            # and extract the FIRST set of Short/Excess values (which is Daily)
+            
+            # Find "Delivery Information: Bag Cement"
+            delivery_info_match = re.search(r'Delivery Information:\s*Bag Cement', body, re.IGNORECASE)
+            if not delivery_info_match:
+                print(f"    ✗ Failed: Could not find 'Delivery Information: Bag Cement'")
+                return None
+            
+            print(f"    Found 'Delivery Information: Bag Cement' section")
+            
+            # Get text after this section
+            after_delivery_info = body[delivery_info_match.end():]
+            
+            # Look for the header row: "Total Delivery  Bag Weight  Physical Weight  Short  Excess"
+            # This appears twice (once for Daily, once for Monthly)
+            header_pattern = r'Total\s+Delivery\s+Bag\s+Weight\s+Physical\s+Weight\s+Short\s+Excess'
+            header_matches = list(re.finditer(header_pattern, after_delivery_info, re.IGNORECASE))
+            
+            if len(header_matches) == 0:
+                print(f"    ✗ Failed: Could not find table header")
+                return None
+            
+            print(f"    Found {len(header_matches)} table header(s)")
+            
+            # Get the FIRST data row after the FIRST header (this is Daily Report)
+            first_header = header_matches[0]
+            after_first_header = after_delivery_info[first_header.end():]
+            
+            # The data row has 5 or 7 numbers (depending on if Monthly columns are included)
+            # Format: Total_Delivery Bag_Weight Physical_Weight Short Excess [Short_Monthly Excess_Monthly]
+            # We want the first 5 numbers
+            
+            # Look for a line with numbers - could be on same line or next lines
+            # Try to find: 5 consecutive numbers (allowing for whitespace and newlines)
+            data_match = re.search(
+                r'(\d+)\s+(\d+)\s+(\d+)\s+(\d+)\s+(\d+)',
+                after_first_header
+            )
+            
+            if not data_match:
+                print(f"    ✗ Failed: Could not find data row with 5 numbers")
+                print(f"    After header text (first 500 chars): {after_first_header[:500]}")
+                return None
+            
+            # Extract values - the 4th and 5th numbers are Short and Excess
+            total_delivery = int(data_match.group(1))
+            bag_weight = int(data_match.group(2))
+            physical_weight = int(data_match.group(3))
+            short = int(data_match.group(4))
+            excess = int(data_match.group(5))
+            
+            print(f"    Found data row:")
+            print(f"      Total Delivery: {total_delivery}")
+            print(f"      Bag Weight: {bag_weight}")
+            print(f"      Physical Weight: {physical_weight}")
+            print(f"      Short: {short}")
+            print(f"      Excess: {excess}")
+            
+            # Extract Per Bag Short/Excess
+            # Look for the FIRST occurrence (Daily Report value)
+            per_bag_match = re.search(r'Per Bags?\s+Short(?:/Excess)?:\s*(-?\d+\.?\d*)', body, re.IGNORECASE)
+            
+            if not per_bag_match:
+                print(f"    ✗ Failed: Could not find 'Per Bag Short/Excess' value")
+                return None
+            
+            per_bag = float(per_bag_match.group(1))
+            print(f"    Found Per Bag Short/Excess: {per_bag}")
+            
+            # Calculate Bag Weight = 50 - (Per Bag Short/Excess)
+            bag_weight = 50.0 - per_bag
+            print(f"    Calculated Bag Weight: {bag_weight} KG")
+            
+            return {
+                'date': formatted_date,
+                'short': short,
+                'excess': excess,
+                'per_bag_short_excess': per_bag,
+                'bag_weight': bag_weight
+            }
+            
+        except Exception as e:
+            print(f"    ✗ Exception during parsing: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
+    
+    def get_date_range_from_month(self, month_str):
+        """Get date range from selected month"""
+        year_month = month_str.split('|')[0]
+        year, month = map(int, year_month.split('-'))
+        
+        from_date = f"{year}-{month:02d}-01"
+        
+        # Last day of month
+        if month == 12:
+            next_month = datetime(year + 1, 1, 1)
+        else:
+            next_month = datetime(year, month + 1, 1)
+        
+        last_day = (next_month - timedelta(days=1)).day
+        to_date = f"{year}-{month:02d}-{last_day:02d}"
+        
+        return from_date, to_date
+    
+    def show_chart_view(self):
+        """Display chart view"""
+        # Clear content frame
+        for widget in self.content_frame.winfo_children():
+            widget.destroy()
+        
+        # Date range selector frame
+        date_frame = tk.Frame(self.content_frame, bg="#f3f4f6", height=60)
+        date_frame.pack(fill=tk.X, padx=10, pady=10)
+        date_frame.pack_propagate(False)
+        
+        tk.Label(date_frame, text="📅", bg="#f3f4f6", font=("Arial", 14)).pack(side=tk.LEFT, padx=10)
+        
+        # Get default dates from selected month
+        from_date, to_date = self.get_date_range_from_month(self.month_var.get())
+        
+        tk.Label(date_frame, text="From:", bg="#f3f4f6", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=5)
+        from_entry = tk.Entry(date_frame, width=12, font=("Arial", 10))
+        from_entry.pack(side=tk.LEFT, padx=5)
+        from_entry.insert(0, from_date)
+        
+        tk.Label(date_frame, text="To:", bg="#f3f4f6", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=5)
+        to_entry = tk.Entry(date_frame, width=12, font=("Arial", 10))
+        to_entry.pack(side=tk.LEFT, padx=5)
+        to_entry.insert(0, to_date)
+        
+        # Checkboxes frame
+        check_frame = tk.Frame(self.content_frame, bg="white")
+        check_frame.pack(fill=tk.X, padx=10, pady=5)
+        
+        self.show_short_var = tk.BooleanVar(value=True)
+        self.show_excess_var = tk.BooleanVar(value=True)
+        self.show_perbag_var = tk.BooleanVar(value=True)
+        self.show_bagweight_var = tk.BooleanVar(value=True)
+        
+        def update_chart():
+            self.plot_chart(canvas_frame, from_entry.get(), to_entry.get())
+        
+        tk.Checkbutton(
+            check_frame, 
+            text="Daily Short (KG)", 
+            variable=self.show_short_var,
+            command=update_chart,
+            bg="white",
+            font=("Arial", 10),
+            fg="#ef4444"
+        ).pack(side=tk.LEFT, padx=10)
+        
+        tk.Checkbutton(
+            check_frame, 
+            text="Daily Excess (KG)", 
+            variable=self.show_excess_var,
+            command=update_chart,
+            bg="white",
+            font=("Arial", 10),
+            fg="#10b981"
+        ).pack(side=tk.LEFT, padx=10)
+        
+        tk.Checkbutton(
+            check_frame, 
+            text="Per Bag Short/Excess", 
+            variable=self.show_perbag_var,
+            command=update_chart,
+            bg="white",
+            font=("Arial", 10),
+            fg="#3b82f6"
+        ).pack(side=tk.LEFT, padx=10)
+        
+        tk.Checkbutton(
+            check_frame, 
+            text="Bag Weight (KG)", 
+            variable=self.show_bagweight_var,
+            command=update_chart,
+            bg="white",
+            font=("Arial", 10),
+            fg="#8b5cf6"
+        ).pack(side=tk.LEFT, padx=10)
+        
+        update_btn = tk.Button(
+            check_frame,
+            text="Update Chart",
+            command=update_chart,
+            bg="#4f46e5",
+            fg="white",
+            font=("Arial", 9, "bold"),
+            padx=15,
+            pady=5,
+            cursor="hand2"
+        )
+        update_btn.pack(side=tk.RIGHT, padx=10)
+        
+        # Chart canvas frame
+        canvas_frame = tk.Frame(self.content_frame, bg="white")
+        canvas_frame.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Initial plot
+        self.plot_chart(canvas_frame, from_date, to_date)
+    
+    def plot_chart(self, parent_frame, from_date, to_date):
+        """Plot the chart"""
+        # Clear previous chart
+        for widget in parent_frame.winfo_children():
+            widget.destroy()
+        
+        # Get data
+        conn = sqlite3.connect(self.db_path)
+        query = """
+            SELECT date, short, excess, per_bag_short_excess, bag_weight
+            FROM delivery_reports
+            WHERE date BETWEEN ? AND ?
+            ORDER BY date
+        """
+        df = pd.read_sql_query(query, conn, params=(from_date, to_date))
+        conn.close()
+        
+        # For old records without bag_weight, calculate it
+        if 'bag_weight' in df.columns:
+            df['bag_weight'] = df.apply(
+                lambda row: row['bag_weight'] if pd.notna(row['bag_weight']) else 50.0 - row['per_bag_short_excess'],
+                axis=1
+            )
+        
+        if df.empty:
+            no_data_label = tk.Label(
+                parent_frame,
+                text="📊 No data available for the selected date range\n\nClick 'Sync Database' to load data",
+                font=("Arial", 14),
+                bg="white",
+                fg="#6b7280"
+            )
+            no_data_label.pack(expand=True)
+            return
+        
+        # Create figure
+        fig = Figure(figsize=(12, 6), dpi=100)
+        ax = fig.add_subplot(111)
+        
+        df['date'] = pd.to_datetime(df['date'])
+        
+        # Plot lines based on checkboxes
+        if self.show_short_var.get():
+            ax.plot(df['date'], df['short'], 'o-', color='#ef4444', linewidth=2, markersize=6, label='Daily Short (KG)')
+        
+        if self.show_excess_var.get():
+            ax.plot(df['date'], df['excess'], 's-', color='#10b981', linewidth=2, markersize=6, label='Daily Excess (KG)')
+        
+        # Use secondary Y-axis for Per Bag and Bag Weight
+        if self.show_perbag_var.get() or self.show_bagweight_var.get():
+            ax2 = ax.twinx()
+            
+            if self.show_perbag_var.get():
+                ax2.plot(df['date'], df['per_bag_short_excess'], '^-', color='#3b82f6', linewidth=2, markersize=6, label='Per Bag S/E')
+            
+            if self.show_bagweight_var.get():
+                ax2.plot(df['date'], df['bag_weight'], 'd-', color='#8b5cf6', linewidth=2, markersize=6, label='Bag Weight (KG)')
+            
+            ax2.set_ylabel('Per Bag S/E / Bag Weight (KG)', fontsize=11, fontweight='bold')
+            ax2.legend(loc='upper right')
+            ax2.grid(False)
+        
+        ax.set_xlabel('Date', fontsize=11, fontweight='bold')
+        ax.set_ylabel('Weight (KG)', fontsize=11, fontweight='bold')
+        ax.set_title('Cement Delivery Report - Daily Analysis', fontsize=14, fontweight='bold')
+        ax.legend(loc='upper left')
+        ax.grid(True, alpha=0.3)
+        
+        fig.autofmt_xdate()
+        fig.tight_layout()
+        
+        # Embed chart in tkinter
+        canvas = FigureCanvasTkAgg(fig, parent_frame)
+        canvas.draw()
+        canvas.get_tk_widget().pack(fill=tk.BOTH, expand=True)
+    
+    def show_table_view(self):
+        """Display table view"""
+        # Clear content frame
+        for widget in self.content_frame.winfo_children():
+            widget.destroy()
+        
+        # Date range selector frame
+        date_frame = tk.Frame(self.content_frame, bg="#f3f4f6", height=60)
+        date_frame.pack(fill=tk.X, padx=10, pady=10)
+        date_frame.pack_propagate(False)
+        
+        tk.Label(date_frame, text="📅", bg="#f3f4f6", font=("Arial", 14)).pack(side=tk.LEFT, padx=10)
+        
+        # Get default dates from selected month
+        from_date, to_date = self.get_date_range_from_month(self.month_var.get())
+        
+        tk.Label(date_frame, text="From:", bg="#f3f4f6", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=5)
+        from_entry = tk.Entry(date_frame, width=12, font=("Arial", 10))
+        from_entry.pack(side=tk.LEFT, padx=5)
+        from_entry.insert(0, from_date)
+        
+        tk.Label(date_frame, text="To:", bg="#f3f4f6", font=("Arial", 10, "bold")).pack(side=tk.LEFT, padx=5)
+        to_entry = tk.Entry(date_frame, width=12, font=("Arial", 10))
+        to_entry.pack(side=tk.LEFT, padx=5)
+        to_entry.insert(0, to_date)
+        
+        def update_table():
+            self.display_table(table_container, from_entry.get(), to_entry.get(), summary_frame)
+        
+        update_btn = tk.Button(
+            date_frame,
+            text="Update Table",
+            command=update_table,
+            bg="#4f46e5",
+            fg="white",
+            font=("Arial", 9, "bold"),
+            padx=15,
+            pady=5,
+            cursor="hand2"
+        )
+        update_btn.pack(side=tk.RIGHT, padx=10)
+        
+        # Summary frame
+        summary_frame = tk.Frame(self.content_frame, bg="white")
+        summary_frame.pack(fill=tk.X, padx=10, pady=10)
+        
+        # Table container
+        table_container = tk.Frame(self.content_frame, bg="white")
+        table_container.pack(fill=tk.BOTH, expand=True, padx=10, pady=5)
+        
+        # Initial display
+        self.display_table(table_container, from_date, to_date, summary_frame)
+    
+    def display_table(self, parent_frame, from_date, to_date, summary_frame):
+        """Display data in table format"""
+        # Clear previous widgets
+        for widget in parent_frame.winfo_children():
+            widget.destroy()
+        for widget in summary_frame.winfo_children():
+            widget.destroy()
+        
+        # Get data
+        conn = sqlite3.connect(self.db_path)
+        query = """
+            SELECT date, short, excess, per_bag_short_excess, bag_weight
+            FROM delivery_reports
+            WHERE date BETWEEN ? AND ?
+            ORDER BY date
+        """
+        df = pd.read_sql_query(query, conn, params=(from_date, to_date))
+        conn.close()
+        
+        # For old records without bag_weight, calculate it
+        if 'bag_weight' in df.columns:
+            df['bag_weight'] = df.apply(
+                lambda row: row['bag_weight'] if pd.notna(row['bag_weight']) else 50.0 - row['per_bag_short_excess'],
+                axis=1
+            )
+        
+        if df.empty:
+            no_data_label = tk.Label(
+                parent_frame,
+                text="📋 No data available for the selected date range\n\nClick 'Sync Database' to load data",
+                font=("Arial", 14),
+                bg="white",
+                fg="#6b7280"
+            )
+            no_data_label.pack(expand=True)
+            return
+        
+        # Calculate totals
+        total_short = df['short'].sum()
+        total_excess = df['excess'].sum()
+        avg_per_bag = df['per_bag_short_excess'].mean()
+        avg_bag_weight = df['bag_weight'].mean()
+        
+        # Display summary cards
+        card1 = tk.Frame(summary_frame, bg="#fee2e2", relief=tk.RAISED, borderwidth=2)
+        card1.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=5, pady=5)
+        tk.Label(card1, text="Total Short", bg="#fee2e2", font=("Arial", 10)).pack(pady=5)
+        tk.Label(card1, text=f"{total_short:,} KG", bg="#fee2e2", font=("Arial", 16, "bold"), fg="#dc2626").pack(pady=5)
+        
+        card2 = tk.Frame(summary_frame, bg="#d1fae5", relief=tk.RAISED, borderwidth=2)
+        card2.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=5, pady=5)
+        tk.Label(card2, text="Total Excess", bg="#d1fae5", font=("Arial", 10)).pack(pady=5)
+        tk.Label(card2, text=f"{total_excess:,} KG", bg="#d1fae5", font=("Arial", 16, "bold"), fg="#059669").pack(pady=5)
+        
+        card3 = tk.Frame(summary_frame, bg="#dbeafe", relief=tk.RAISED, borderwidth=2)
+        card3.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=5, pady=5)
+        tk.Label(card3, text="Avg Per Bag S/E", bg="#dbeafe", font=("Arial", 10)).pack(pady=5)
+        tk.Label(card3, text=f"{avg_per_bag:.4f}", bg="#dbeafe", font=("Arial", 16, "bold"), fg="#2563eb").pack(pady=5)
+        
+        card4 = tk.Frame(summary_frame, bg="#e9d5ff", relief=tk.RAISED, borderwidth=2)
+        card4.pack(side=tk.LEFT, expand=True, fill=tk.BOTH, padx=5, pady=5)
+        tk.Label(card4, text="Avg Bag Weight", bg="#e9d5ff", font=("Arial", 10)).pack(pady=5)
+        tk.Label(card4, text=f"{avg_bag_weight:.3f} KG", bg="#e9d5ff", font=("Arial", 16, "bold"), fg="#7c3aed").pack(pady=5)
+        
+        # Create treeview
+        tree_frame = tk.Frame(parent_frame)
+        tree_frame.pack(fill=tk.BOTH, expand=True)
+        
+        # Scrollbars
+        vsb = tk.Scrollbar(tree_frame, orient="vertical")
+        hsb = tk.Scrollbar(tree_frame, orient="horizontal")
+        
+        tree = ttk.Treeview(
+            tree_frame,
+            columns=("Date", "Short", "Excess", "PerBag", "BagWeight"),
+            show="headings",
+            yscrollcommand=vsb.set,
+            xscrollcommand=hsb.set,
+            height=20
+        )
+        
+        vsb.config(command=tree.yview)
+        hsb.config(command=tree.xview)
+        
+        # Define columns
+        tree.heading("Date", text="Date", anchor=tk.CENTER)
+        tree.heading("Short", text="Short (KG)", anchor=tk.CENTER)
+        tree.heading("Excess", text="Excess (KG)", anchor=tk.CENTER)
+        tree.heading("PerBag", text="Per Bag Short/Excess", anchor=tk.CENTER)
+        tree.heading("BagWeight", text="Bag Weight (KG)", anchor=tk.CENTER)
+        
+        tree.column("Date", width=120, anchor=tk.CENTER)
+        tree.column("Short", width=120, anchor=tk.CENTER)
+        tree.column("Excess", width=120, anchor=tk.CENTER)
+        tree.column("PerBag", width=150, anchor=tk.CENTER)
+        tree.column("BagWeight", width=150, anchor=tk.CENTER)
+        
+        # Style
+        style = ttk.Style()
+        style.configure("Treeview", font=("Arial", 10), rowheight=30)
+        style.configure("Treeview.Heading", font=("Arial", 11, "bold"), background="#4f46e5", foreground="white")
+        
+        # Insert data
+        for idx, row in df.iterrows():
+            date_formatted = datetime.strptime(row['date'], '%Y-%m-%d').strftime('%d-%b-%Y')
+            tree.insert("", "end", values=(
+                date_formatted,
+                f"{int(row['short']):,}",
+                f"{int(row['excess']):,}",
+                f"{row['per_bag_short_excess']:.4f}",
+                f"{row['bag_weight']:.3f}"
+            ), tags=('oddrow' if idx % 2 == 0 else 'evenrow',))
+        
+        tree.tag_configure('oddrow', background='#f9fafb')
+        tree.tag_configure('evenrow', background='white')
+        
+        # Pack scrollbars and tree
+        vsb.pack(side=tk.RIGHT, fill=tk.Y)
+        hsb.pack(side=tk.BOTTOM, fill=tk.X)
+        tree.pack(fill=tk.BOTH, expand=True)
+
+
+def main():
+    """Main function to run the application"""
+    root = tk.Tk()
+    app = CementDeliveryTracker(root)
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
