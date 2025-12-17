@@ -1,0 +1,5 @@
+v_0.1.3   : Version number showing.
+v_0.1.2   : Close Button Added in Full Screen Mode.
+v_0.1.1   : Full Screen Mode enabled using ESC button toggling the Full Screen Mode to windowed mode.
+v_0.1.0   : email body Data parsing issue solved.
+v_0.0.25 : email date parsing was only DD_MMM_YYYY
